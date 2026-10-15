@@ -8,7 +8,7 @@ URL — is why checks 8 and 9 exist before and around the deploy rather than aft
 The checks split into two phases because check 9 can only run once EventBridge is
 up:
 
-    --phase pre     checks 1-8 and 10-12, before anything is applied
+    --phase pre     checks 1-8 and 10-14, before anything is applied
     --phase public  check 9 only, the gate between deploy steps 4 and 5
     --phase all     both (default when run standalone against a live deploy)
 
@@ -25,6 +25,7 @@ import argparse
 import json
 import os
 import pathlib
+import re
 import socket
 import sys
 import urllib.error
@@ -67,6 +68,45 @@ print(f"FIX-VERIFIED mock={f.mock_claude}")
 import ssl
 print("CA-BUNDLE", ssl.get_default_verify_paths().cafile or "MISSING")
 """
+
+
+# Which service each `*_REQUIRE_*SIGNATURE` key belongs to, and the module whose
+# importability proves that service can actually honour it. Check 14 probes one pod per
+# ENFORCING service, so an overlay that enforces neither pays nothing.
+#
+# The module is each service's `__main__` on purpose, and it is the whole difference
+# between this check working and not. Both images run `python -m <pkg>`, so `__main__`
+# is exactly what the container executes — and it is the only target that actually
+# catches the 2026-10-14 bug. Verified by blocking `eventrunner` at the import system:
+# `eventbridge.kafka_in` imports FINE without it and would have passed against the
+# broken image; `eventbridge.__main__` raises ModuleNotFoundError, because
+# `handlers.py:18` does `from eventrunner import agentspec` at module level. Picking a
+# plausible-looking module instead of the one that runs is how a check verifies an
+# intent rather than a state. Importing is side-effect free: both files guard `main()`
+# behind `if __name__ == "__main__"`.
+ENFORCEMENT_KEYS = {
+    "eventrunner": ("ER_REQUIRE_SIGNATURE", "eventrunner.__main__"),
+    "eventbridge": ("EB_REQUIRE_RESPONSE_SIGNATURE", "eventbridge.__main__"),
+}
+
+
+def configmap_value(rendered: str, name: str, key: str) -> str | None:
+    """One key's value out of a rendered ConfigMap, or None when it is absent.
+
+    Regex over the rendered YAML rather than a parser because §1.1 bans `pyyaml` and
+    this needs no more: the same approach `tests/test_manifests.py` has used since
+    Phase 1. Splitting on document separators first matters — `eventing-config` is one
+    of several ConfigMaps in the render, and a bare search would happily read a key
+    out of a different document.
+    """
+    for doc in (d for d in re.split(r"(?m)^---\s*$", rendered) if d.strip()):
+        if not re.search(r"(?m)^kind:\s*ConfigMap\s*$", doc):
+            continue
+        if not re.search(rf"(?m)^\s+name:\s*{re.escape(name)}\s*$", doc):
+            continue
+        m = re.search(rf'(?m)^\s+{re.escape(key)}:\s*"?([^"\n]*)"?\s*$', doc)
+        return m.group(1).strip() if m else None
+    return None
 
 
 class Preflight:
@@ -599,6 +639,107 @@ class Preflight:
         finally:
             self.k.delete("pod", name, namespace=self.ns)
 
+    # ---- 14 -------------------------------------------------------------
+    def signing_enforcement(self) -> dict[str, bool]:
+        """Which services THIS overlay turns enforcement on for.
+
+        Read from the rendered manifests, not inferred from the overlay's name. That
+        distinction is the whole point of #10: a name is an intent, the ConfigMap is
+        the state, and checks 12/13 gate on the name — so a future `demo-signed` or
+        `ocp-signed` would silently skip this check if it did the same.
+
+        Rendering is local and needs no cluster (`k8slib.Kubectl.kustomize`). A key
+        that is absent reads as off, matching both services' own defaults
+        (`eventrunner/config.py` `_bool(..., False)`, `eventbridge/config.py`
+        `require_response_signature: bool = False`).
+        """
+        overlay = K8S / "overlays" / self.args.overlay
+        rendered = self.k.kustomize(str(overlay))
+        return {
+            svc: (configmap_value(rendered, "eventing-config", key) or "").lower() == "true"
+            for svc, (key, _mod) in ENFORCEMENT_KEYS.items()
+        }
+
+    def check_signing_code_present(self) -> None:
+        """Check 4 proves an image can be PULLED. This proves it can do the thing the
+        overlay is about to enforce.
+
+        #10, and the reason it is a separate check rather than a line in check 4:
+        pullability and contents are different properties, and on 2026-10-14 check 4
+        passed green against an EventBridge image that had no signing code in it —
+        `handlers.py` imports `eventrunner.agentspec` and the Dockerfile never COPYed
+        it. The deploy then enabled enforcement on top. EventRunner refused every
+        request, including this system's own traffic, while the banner read
+        `ENFORCING`. Four indicators were green and diagnosis took an evening.
+
+        An import, not a grep for a log string: the bug that happened WAS an
+        ImportError, so importing reproduces it exactly, and a banner string is a line
+        somebody may reword. The module imported is each service's `__main__` — see
+        ENFORCEMENT_KEYS for why that specific choice is what makes this check catch
+        the original bug rather than pass alongside it.
+        """
+        enforcing = self.signing_enforcement()
+        if not any(enforcing.values()):
+            self.c.log(f"overlay {self.args.overlay!r} enforces no signatures "
+                       f"(ER_REQUIRE_SIGNATURE / EB_REQUIRE_RESPONSE_SIGNATURE are "
+                       f"not \"true\") — nothing to assert")
+            return
+        for svc, on in sorted(enforcing.items()):
+            if not on:
+                self.c.log(f"{svc}: enforcement off in this overlay — skipping")
+                continue
+            self._probe_signing_code(svc, getattr(self.images, svc),
+                                     ENFORCEMENT_KEYS[svc][1])
+
+    def _probe_signing_code(self, svc: str, ref: str, module: str) -> None:
+        """Run the service's own image and make it import what enforcement needs."""
+        name = f"rossoctl-preflight-signing-{svc}"
+        self.k.delete("pod", name, namespace=self.ns)
+        probe = (
+            "import shared.signing as s; "
+            "s.verify_request; s.response_decision; s.sign_into; "
+            f"import {module}; "
+            "print('signing-ok')"
+        )
+        pod = {
+            "apiVersion": "v1", "kind": "Pod",
+            "metadata": {"name": name, "namespace": self.ns},
+            "spec": {"restartPolicy": "Never",
+                     "securityContext": {"runAsNonRoot": True,
+                                         "seccompProfile": {"type": "RuntimeDefault"}},
+                     "containers": [{
+                         "name": "probe", "image": ref,
+                         "command": ["python", "-c", probe],
+                         "securityContext": {"allowPrivilegeEscalation": False,
+                                             "capabilities": {"drop": ["ALL"]}},
+                     }]},
+        }
+        if not self.c.expect_run(self.k.apply_stdin(json.dumps(pod), namespace=self.ns),
+                                 f"{svc} signing-code probe pod created"):
+            return
+        try:
+            wait_for(lambda: dig(self.k.get("pod", name, namespace=self.ns,
+                                            missing_ok=True) or {},
+                                 "status", "phase", default="") in ("Succeeded", "Failed"),
+                     timeout=180, interval=3)
+            phase = dig(self.k.get("pod", name, namespace=self.ns, missing_ok=True) or {},
+                        "status", "phase", default="?")
+            logs = self.k.logs(name, namespace=self.ns, tail=40)
+            detail = (f"phase={phase} image={ref}\n{logs}\n"
+                      f"  This overlay enforces signatures, and this image cannot "
+                      f"verify them. Rebuild and re-push (or `kind load`) the image "
+                      f"for tag {self.args.tag!r}; deploying now would refuse every "
+                      f"event, including this system's own, while the startup banner "
+                      f"still reads ENFORCING.")
+            if not self.c.expect(phase == "Succeeded",
+                                 f"{svc} image {ref} imports the signing code it "
+                                 f"is about to enforce", detail):
+                return
+            self.c.expect_contains(logs, "signing-ok",
+                                   f"{svc} probe reported signing-ok")
+        finally:
+            self.k.delete("pod", name, namespace=self.ns)
+
 
 CHECKS = {
     1: ("cluster reachable + context confirmed", "check_cluster"),
@@ -612,6 +753,7 @@ CHECKS = {
     11: ("namespace + quota", "check_namespace"),
     12: ("default StorageClass (demo overlay)", "check_storageclass"),
     13: ("claude CLI image runs on a real node (demo overlay)", "check_claude_cli_image"),
+    14: ("images contain the signing code the overlay enforces", "check_signing_code_present"),
 }
 # Check 5 (node arch vs image platforms) is folded into check 4: it needs the same
 # manifest fetch, and splitting it would mean fetching twice.
@@ -635,7 +777,12 @@ def build_args(argv=None):
     ap.add_argument("--context", default=None, help="pin the kube context explicitly")
     ap.add_argument("--yes", action="store_true",
                     help="accept the ambient current-context without pinning it")
-    ap.add_argument("--overlay", default="test", choices=("test", "kind", "demo"))
+    # `kind-signed` is listed because `k8s_deploy.py` already passes it straight into
+    # `Preflight` (it builds one from its own args), so leaving it out here made it a
+    # value preflight accepted, never validated, and no check read — which is part of
+    # why check 4 passed against an image that could not sign. Check 14 reads it.
+    ap.add_argument("--overlay", default="test",
+                    choices=("test", "kind", "demo", "kind-signed"))
     ap.add_argument("--registry", default=os.environ.get("REGISTRY_PREFIX", DEFAULT_REGISTRY))
     ap.add_argument("--tag", default=os.environ.get("TAG", DEFAULT_TAG))
     ap.add_argument("--phase", default="pre", choices=("pre", "public", "all"))
