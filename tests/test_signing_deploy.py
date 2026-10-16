@@ -380,6 +380,21 @@ def test_configmap_value_is_none_when_the_key_is_absent():
     assert PF.configmap_value(rendered, "nope", "ER_REQUIRE_SIGNATURE") is None
 
 
+def test_signing_enforcement_refuses_a_render_with_no_eventing_config(monkeypatch):
+    """A render missing the `eventing-config` ConfigMap entirely is not "enforcement
+    off" — it is a check that failed to find the state it reads, and that is
+    indistinguishable from a genuinely-absent key through `configmap_value`'s `None`.
+    A `namePrefix`, a `configMapGenerator` (content-hash suffix) or a rename all do
+    this, and `eventing-config` is an unconditional resource of
+    `k8s/base/kustomization.yaml`, so the only honest response is to refuse."""
+    pf = _pf("kind")
+    monkeypatch.setattr(pf.k, "kustomize", lambda path: (
+        "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: something-else\ndata:\n"
+        '  ER_REQUIRE_SIGNATURE: "true"\n'))
+    with pytest.raises(RuntimeError, match="renders no ConfigMap named 'eventing-config'"):
+        pf.signing_enforcement()
+
+
 @needs_kubectl
 def test_the_signed_overlay_is_detected_as_enforcing_both_directions():
     """Driven off the REAL render, because the point of #10 is to read the state
@@ -407,9 +422,14 @@ def test_the_check_creates_no_pod_when_nothing_is_enforced(monkeypatch):
     assert pf.c.failed == 0
 
 
-def test_only_the_enforcing_service_is_probed(monkeypatch):
-    """Enforcement is per-service in the ConfigMap, so the check must be too — a
-    deployment could enable one direction and not the other."""
+def test_both_services_are_probed_when_only_one_direction_enforces(monkeypatch):
+    """Enforcement and signing sit on opposite ends of the wire: `ER_REQUIRE_SIGNATURE`
+    is verified by eventrunner but SIGNED by eventbridge (`kafka_out.py`), and
+    vice versa. So the service that must carry the signing code when one direction
+    enforces is the OTHER one, not just the enforcing one — probing only the
+    enforcing service would have missed 2026-10-14 in its original orientation,
+    where the image without the code was the bridge's and the service that refused
+    everything was the runner."""
     pf = _pf("kind-signed")
     monkeypatch.setattr(pf, "signing_enforcement",
                         lambda: {"eventrunner": True, "eventbridge": False})
@@ -417,7 +437,25 @@ def test_only_the_enforcing_service_is_probed(monkeypatch):
     monkeypatch.setattr(pf, "_probe_signing_code",
                         lambda svc, ref, mod: probed.append((svc, mod)))
     pf.check_signing_code_present()
-    assert probed == [("eventrunner", "eventrunner.__main__")]
+    assert sorted(probed) == [("eventbridge", "eventbridge.__main__"),
+                              ("eventrunner", "eventrunner.__main__")]
+
+
+def test_the_probe_fails_fast_on_an_unpullable_image_without_creating_a_pod(monkeypatch):
+    """Check 4 normally proves pullability first, but it is skippable (`--skip 4`),
+    and this check must not then burn its full 180s wait in ImagePullBackOff only to
+    report `phase=Pending` under a message about missing signing code -- the wrong
+    diagnosis for a pull failure."""
+    pf = _pf("kind-signed")
+    monkeypatch.setattr(PF, "registry_manifest",
+                        lambda ref, **kw: (404, None, "not found"))
+    created = []
+    monkeypatch.setattr(pf.k, "apply_stdin",
+                        lambda *a, **k: created.append(1) or pytest.fail("pod created"))
+    pf._probe_signing_code("eventrunner", "example.com/not-pushed:latest",
+                           "eventrunner.__main__")
+    assert created == []
+    assert pf.c.failed == 1
 
 
 def test_the_probe_targets_each_services_own_main_module():

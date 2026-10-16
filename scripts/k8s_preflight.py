@@ -84,6 +84,12 @@ print("CA-BUNDLE", ssl.get_default_verify_paths().cafile or "MISSING")
 # plausible-looking module instead of the one that runs is how a check verifies an
 # intent rather than a state. Importing is side-effect free: both files guard `main()`
 # behind `if __name__ == "__main__"`.
+#
+# Each key is read by the service named here, but SIGNED by the other one:
+# ER_REQUIRE_SIGNATURE is verified by eventrunner, and the signature it demands is
+# produced by eventbridge (kafka_out.py); EB_REQUIRE_RESPONSE_SIGNATURE is the mirror.
+# So the enforcing service is never self-sufficient — see check_signing_code_present's
+# "probe anyway" branch, which exists because of this.
 ENFORCEMENT_KEYS = {
     "eventrunner": ("ER_REQUIRE_SIGNATURE", "eventrunner.__main__"),
     "eventbridge": ("EB_REQUIRE_RESPONSE_SIGNATURE", "eventbridge.__main__"),
@@ -655,6 +661,18 @@ class Preflight:
         """
         overlay = K8S / "overlays" / self.args.overlay
         rendered = self.k.kustomize(str(overlay))
+        # A render with no `eventing-config` in it is not "enforcement off" — it is a
+        # check that failed to find the state it reads. Both look identical through
+        # `configmap_value`'s None, and quietly reporting "nothing to assert" is the
+        # §10 failure mode itself, so refuse instead. A `namePrefix`, a
+        # `configMapGenerator` (which suffixes a content hash) or a rename all trigger
+        # this; `eventing-config` is an unconditional resource of
+        # `k8s/base/kustomization.yaml`, so its absence is always a lookup bug.
+        if not re.search(r"(?m)^\s+name:\s*eventing-config\s*$", rendered):
+            raise RuntimeError(
+                f"overlay {self.args.overlay!r} renders no ConfigMap named "
+                f"'eventing-config' — check 14 cannot read what is enforced. Fix the "
+                f"lookup rather than letting the check pass having verified nothing.")
         return {
             svc: (configmap_value(rendered, "eventing-config", key) or "").lower() == "true"
             for svc, (key, _mod) in ENFORCEMENT_KEYS.items()
@@ -686,13 +704,30 @@ class Preflight:
             return
         for svc, on in sorted(enforcing.items()):
             if not on:
-                self.c.log(f"{svc}: enforcement off in this overlay — skipping")
-                continue
+                # NOT `continue`: enforcement in one direction makes the OTHER
+                # service's signing code load-bearing, because that is who produces
+                # the signature being demanded (ER_REQUIRE_SIGNATURE -> eventbridge
+                # signs, via kafka_out.py; EB_REQUIRE_RESPONSE_SIGNATURE ->
+                # eventrunner signs, via emit.py). Probing only the enforcing service
+                # would have missed 2026-10-14 in its original orientation, where the
+                # image without the code was the BRIDGE's and the service that refused
+                # everything was the runner. If anything is enforced at all, both
+                # images must carry the code.
+                self.c.log(f"{svc}: enforcement off here, but the other direction "
+                           f"enforces and this service is its signer — probing anyway")
             self._probe_signing_code(svc, getattr(self.images, svc),
                                      ENFORCEMENT_KEYS[svc][1])
 
     def _probe_signing_code(self, svc: str, ref: str, module: str) -> None:
         """Run the service's own image and make it import what enforcement needs."""
+        # Check 4 normally proves pullability first, but it is skippable (`--skip 4`)
+        # and this must not then spend 180 s in ImagePullBackOff only to report
+        # `phase=Pending` under a message about missing signing code.
+        status, _body, err = registry_manifest(ref)
+        if not self.c.expect(status == 200, f"{ref} is anonymously pullable",
+                             f"status={status} {err}\n"
+                             f"  Build and push it: python3 scripts/build_images.py"):
+            return
         name = f"rossoctl-preflight-signing-{svc}"
         self.k.delete("pod", name, namespace=self.ns)
         probe = (
@@ -777,10 +812,12 @@ def build_args(argv=None):
     ap.add_argument("--context", default=None, help="pin the kube context explicitly")
     ap.add_argument("--yes", action="store_true",
                     help="accept the ambient current-context without pinning it")
-    # `kind-signed` is listed because `k8s_deploy.py` already passes it straight into
-    # `Preflight` (it builds one from its own args), so leaving it out here made it a
-    # value preflight accepted, never validated, and no check read — which is part of
-    # why check 4 passed against an image that could not sign. Check 14 reads it.
+    # `kind-signed` is listed so the standalone invocation documented above
+    # (`python3 scripts/k8s_preflight.py --overlay kind-signed`) stops dying with
+    # `invalid choice` — check 14 is exactly the check someone wants to run that way.
+    # Note this parser is NOT what gated the deploy path: `k8s_deploy.py` builds its
+    # own args and passes them straight into `Preflight` (k8s_deploy.py:688), so
+    # `kind-signed` was always validated there, by that script's own `choices`.
     ap.add_argument("--overlay", default="test",
                     choices=("test", "kind", "demo", "kind-signed"))
     ap.add_argument("--registry", default=os.environ.get("REGISTRY_PREFIX", DEFAULT_REGISTRY))
