@@ -214,14 +214,18 @@ def post_expecting_refusal(url, *, body=None, headers=None, timeout=10.0):
     try:
         with urllib.request.urlopen(req, timeout=timeout) as r:
             raw = r.read()
-            return r.status, dict(r.headers), (json.loads(raw) if raw else None)
+            return r.status, r.headers, (json.loads(raw) if raw else None)
     except urllib.error.HTTPError as e:
         raw = e.read()
         try:
             parsed = json.loads(raw) if raw else None
         except ValueError:
             parsed = {"raw": raw[:200].decode("utf-8", "replace")}
-        return e.code, dict(e.headers), parsed
+        # `e.headers`, not `dict(e.headers)`: it is an `email.message.Message`, whose
+        # `.get()` is case-insensitive. Header names are case-insensitive per RFC 9110,
+        # and a proxy hop may return `www-authenticate` — a plain dict would then miss
+        # the challenge the caller asserts on.
+        return e.code, e.headers, parsed
     except (urllib.error.URLError, OSError):
         return None, {}, None
 
@@ -283,8 +287,11 @@ class Flow:
                           namespace=self.ns, missing_ok=True) or {}
 
     def turns(self) -> list[dict]:
+        return self.turns_for(self.corr)
+
+    def turns_for(self, corr: str) -> list[dict]:
         try:
-            _, body = get_json(f"{self.base}/v0/agents/{self.corr}/turns")
+            _, body = get_json(f"{self.base}/v0/agents/{corr}/turns")
         except (urllib.error.URLError, OSError):
             return []
         return (body or {}).get("turns") or []
@@ -1145,34 +1152,35 @@ class Flow:
             return
         self.c.note("identity-gate correlation", str(corr))
 
-        # 4. The verified login rides on the event. This is the payoff: not that a
-        #    request was allowed, but that WHO asked is now recorded on the wire.
+        # 4. The verified login rides on the submission. This is the payoff: not that a
+        #    request was allowed, but that WHO asked is now recorded.
+        #
+        #    Read `…/turns`, NOT `…/events.jsonl`. The latter serves the `responses`
+        #    table (`store.raw_events_for`), written only by the responses consumer
+        #    (`kafka_in.py`), and `eventrunner/emit.py` puts no `submitter` on a
+        #    response event. The verified login is stored by `insert_prompt`
+        #    (handlers.py:279) and surfaced per turn by `get_turns` (handlers.py:631).
         deadline = time.monotonic() + 90
-        evt = None
+        turn = None
         while time.monotonic() < deadline:
-            try:
-                raw = urllib.request.urlopen(
-                    f"{self.base}/v0/agents/{corr}/events.jsonl", timeout=15
-                ).read().decode()
-                events = [json.loads(ln) for ln in raw.splitlines() if ln.strip()]
-            except (urllib.error.URLError, OSError, ValueError):
-                events = []
-            if events:
-                evt = events[0]
+            turns = self.turns_for(corr)
+            if turns:
+                turn = turns[0]
                 break
             time.sleep(2)
-        if not self.c.expect(evt is not None,
-                             "the submitted request reached the transcript",
-                             f"no events for {corr} within 90 s"):
+        if not self.c.expect(turn is not None,
+                             "the submitted request reached the turn tape",
+                             f"no turns for {corr} within 90 s"):
             return
-        self.c.expect(str(evt.get("submitter", "")).lower() == login,
-                      f"the event carries ce_submitter={login} — the login GitHub "
+        self.c.expect(str(turn.get("submitter", "")).lower() == login,
+                      f"the submission records submitter={login} — the login GitHub "
                       f"vouched for, not one the caller typed",
-                      f"submitter={evt.get('submitter')!r}")
-        self.c.expect(evt.get("submitteriss") == "github",
-                      "and ce_submitteriss=github, so a reader can tell a verified "
-                      "identity from an operator-configured name",
-                      f"submitteriss={evt.get('submitteriss')!r}")
+                      f"submitter={turn.get('submitter')!r}")
+        # `ce_submitteriss` is deliberately NOT asserted here: it is set on the request
+        # CloudEvent (handlers.py:287) and never persisted — no column in `prompts`, no
+        # route returns it. Asserting it over HTTP would be asserting nothing. The
+        # issuer claim is covered by the SIGNED_ATTRS check below; proving it end to end
+        # means reading the requests topic, the way `_publish_forgery` reaches Kafka.
 
         # 5. And it is covered by the signature, which is what makes it trustworthy
         #    downstream — EventRunner's ER_ALLOWED_SUBMITTERS check runs AFTER the

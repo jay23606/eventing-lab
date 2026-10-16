@@ -410,7 +410,7 @@ asked is worth more than the 30 seconds it costs.
 ### 8.3 The identity gate — who *asked*  (R-identity)
 
 🟡 **PARTIAL — built, not yet run on a cluster.** The stage is implemented
-(`assert_identity_gate`, `k8s_demo_flow.py`) with 17 tests, including four that drive it
+(`assert_identity_gate`, `k8s_demo_flow.py`) with tests, including three that drive it
 against a deliberately-broken bridge and require it to fail. **It has not run against a
 cluster**, so do not mark it 🟢 or narrate it as verified until it has —
 [eventing-lab#14](https://github.com/rossoctl/eventing-lab/issues/14).
@@ -430,8 +430,8 @@ Edit `EB_ALLOWED_USERS` and `ER_ALLOWED_SUBMITTERS` in
 
 **On screen:** three `POST /v0/agents` calls in a row. No credential → **401** with
 `WWW-Authenticate: Bearer realm="eventbridge"`. A junk token → **401 again**. The approved
-user's token → **202**, and then the transcript showing `ce_submitter=<login>` and
-`ce_submitteriss=github`.
+user's token → **202**, and then `GET …/turns` showing `submitter=<login>` — the login
+GitHub vouched for, read back from the turn tape rather than typed by the caller.
 
 **Say:** the first request was not rejected by a signature check — it never became an event
 at all. EventBridge refuses before the first write, so there is no transcript, no correlation

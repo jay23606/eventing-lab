@@ -336,7 +336,6 @@ class _RequireCfg:
 import os  # noqa: E402
 import re  # noqa: E402
 import threading  # noqa: E402
-import types  # noqa: E402
 from http.server import BaseHTTPRequestHandler, HTTPServer  # noqa: E402
 from pathlib import Path  # noqa: E402
 
@@ -367,12 +366,20 @@ def _call_lines(src: str, name: str) -> list[int]:
 
 
 class _Gate(BaseHTTPRequestHandler):
-    """A fake EventBridge. Class attributes let each test bend one behaviour."""
+    """A fake EventBridge. Class attributes let each test bend one behaviour.
+
+    `do_GET` answers `/v0/agents/<corr>/turns` — the ONLY route that carries
+    `submitter` for a real deployment (`handlers.get_turns`, handlers.py:631). It
+    used to answer with an `events.jsonl`-shaped line instead, which is a route that
+    real EventBridge never produces `submitter` on at all (that field lives on the
+    `prompts` table, not `responses`) — so every one of these tests was passing
+    against a fixture that encoded a false belief about the system rather than its
+    actual behaviour.
+    """
 
     accept_any = False
     open_door = False
     submitter = LOGIN
-    submitteriss = "github"
 
     def do_POST(self):
         a = self.headers.get("Authorization")
@@ -390,9 +397,8 @@ class _Gate(BaseHTTPRequestHandler):
         self.wfile.write(payload)
 
     def do_GET(self):
-        evt = {"submitter": self.submitter, "submitteriss": self.submitteriss,
-               "phase": "prompt", "sequence": 0}
-        payload = (json.dumps(evt) + "\n").encode()
+        body = {"turns": [{"turn_index": 0, "submitter": self.submitter}]}
+        payload = json.dumps(body).encode()
         self.send_response(200)
         self.send_header("Content-Length", str(len(payload)))
         self.end_headers()
@@ -403,14 +409,20 @@ class _Gate(BaseHTTPRequestHandler):
 
 
 def _run_gate(handler_cls, *, token=TOKEN, login=LOGIN) -> Checks:
-    """Drive the real `assert_identity_gate` against a fake bridge. Returns Checks."""
+    """Drive the real `assert_identity_gate` against a fake bridge. Returns Checks.
+
+    Calls the REAL `Flow.__init__` with real `build_args` output, for the reason
+    `_flow` does: a hand-built `args` namespace would make these tests fail with
+    AttributeError the day the stage reads one more argument, rather than report
+    anything about the stage. Only `base` is overridden — `__init__` leaves it `""`
+    and `stage0()` normally fills it in from the Route or `--public-url`.
+    """
     srv = HTTPServer(("127.0.0.1", 0), handler_cls)
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     c = Checks(prefix="test")
-    f = flow.Flow.__new__(flow.Flow)
-    f.c = c
+    args = flow.build_args(["--overlay", "kind-signed-auth", "--gh-login", login])
+    f = flow.Flow(None, c, args)
     f.base = f"http://127.0.0.1:{srv.server_address[1]}"
-    f.args = types.SimpleNamespace(gh_login=login)
     prior = os.environ.get("DEMO_GH_TOKEN")
     try:
         if token is None:
@@ -472,7 +484,7 @@ def test_post_expecting_refusal_returns_the_refusal_instead_of_raising():
 def test_the_identity_gate_passes_against_a_correctly_configured_bridge():
     c = _run_gate(_Gate)
     assert c.failed == 0, c.failures
-    assert c.passed == 10, f"expected 10 assertions, got {c.passed}"
+    assert c.passed == 9, f"expected 9 assertions, got {c.passed}"
 
 
 def test_the_identity_gate_skips_without_a_token_rather_than_failing():
@@ -482,10 +494,17 @@ def test_the_identity_gate_skips_without_a_token_rather_than_failing():
     assert (c.passed, c.failed) == (0, 0)
 
 
-def test_the_identity_gate_never_logs_the_token():
+def test_the_identity_gate_never_logs_the_token(capsys):
     """The token is a live credential. It must not reach a terminal transcript that
-    gets pasted into an issue — the same rule `gen_signing_keys` follows for seeds."""
+    gets pasted into an issue — the same rule `gen_signing_keys` follows for seeds.
+
+    Checks stdout/stderr as well as the recorded failures and notes: `Checks.log`/
+    `ok`/`fail` all print, and a pasted terminal is the actual exposure.
+    `failures`/`notes` alone cover the two places the token is LEAST likely to be."""
     c = _run_gate(_Gate)
+    out = capsys.readouterr()
+    assert TOKEN not in out.out, "token reached stdout"
+    assert TOKEN not in out.err, "token reached stderr"
     assert TOKEN not in " ".join(c.failures)
     for key, val in (c.notes or {}).items():
         assert TOKEN not in f"{key}{val}", f"token leaked into note {key!r}"
@@ -515,15 +534,6 @@ def test_the_identity_gate_fails_when_the_submitter_is_not_stamped():
     class NoSub(_Gate):
         submitter = ""
     c = _run_gate(NoSub)
-    assert c.failed >= 1
-
-
-def test_the_identity_gate_fails_when_the_issuer_is_not_github():
-    """`ce_submitteriss` is what lets a reader tell a GitHub-verified login from a name
-    an operator typed into an environment variable."""
-    class Static(_Gate):
-        submitteriss = "static"
-    c = _run_gate(Static)
     assert c.failed >= 1
 
 
