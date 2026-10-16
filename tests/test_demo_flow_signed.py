@@ -29,14 +29,17 @@ SEED_R1 = binascii.unhexlify(
 
 
 def _flow(overlay: str, *extra):
-    """A Flow with no Kubectl and no Checks — only the constructor's own decisions."""
+    """A Flow with no Kubectl and no Checks — only the constructor's own decisions.
+
+    Calls the REAL `Flow.__init__` rather than recomputing `mock`/`signed_beats`
+    here. An earlier version of this helper duplicated those two expressions, so it
+    was asserting a copy of the logic and not the logic: the `signed_beats` fix for
+    `kind-signed-auth` landed in the constructor and these tests kept passing against
+    the stale copy. That is §8.6's rule — call the real function; a reimplementation of
+    the decision proves nothing about the decision.
+    """
     args = flow.build_args(["--overlay", overlay, *extra])
-    f = flow.Flow.__new__(flow.Flow)
-    f.args = args
-    f.mock = args.overlay != "demo"
-    f.signed_beats = (args.signed_beats if args.signed_beats is not None
-                      else args.overlay == "kind-signed")
-    return f
+    return flow.Flow(None, None, args)
 
 
 # ---- which overlay means what ------------------------------------------------
@@ -321,3 +324,252 @@ class _RequireCfg:
     require_signature = True
     verify_key_path = ""
     verify_keyset_path = "/etc/ce-keyset/agents.json"
+
+
+# ---- the identity gate: who ASKED (eventing-lab#2 follow-on) -----------------
+#
+# The signed beats prove which approved KEY signed. Nothing in the flow proved which
+# PERSON asked. `assert_identity_gate` does, and then shows the answer is
+# tamper-evident. These cover the parts that decide whether the beat proves anything,
+# none of which needs a cluster.
+
+import os  # noqa: E402
+import re  # noqa: E402
+import threading  # noqa: E402
+import types  # noqa: E402
+from http.server import BaseHTTPRequestHandler, HTTPServer  # noqa: E402
+from pathlib import Path  # noqa: E402
+
+from proclib import Checks  # noqa: E402
+
+REPO = Path(__file__).resolve().parent.parent
+LOGIN = "mrsabath"
+TOKEN = "ghp_demo_token_not_real"
+
+
+def _flow_src() -> str:
+    return (REPO / "scripts" / "k8s_demo_flow.py").read_text()
+
+
+def _call_lines(src: str, name: str) -> list[int]:
+    """Line numbers where `name` is CALLED — not defined, not named in a comment.
+
+    Same helper, and same reason, as `tests/test_dockerfile_packaging.py`: an earlier
+    guard there passed against code with the call deleted, because a comment and the
+    `def` both matched a raw text search.
+    """
+    out = []
+    for n, line in enumerate(src.splitlines(), 1):
+        code = line.split("#", 1)[0]
+        if re.search(rf"(?<!def )\b{re.escape(name)}\s*\(", code):
+            out.append(n)
+    return out
+
+
+class _Gate(BaseHTTPRequestHandler):
+    """A fake EventBridge. Class attributes let each test bend one behaviour."""
+
+    accept_any = False
+    open_door = False
+    submitter = LOGIN
+    submitteriss = "github"
+
+    def do_POST(self):
+        a = self.headers.get("Authorization")
+        ok = self.open_door or (self.accept_any and a) or a == f"Bearer {TOKEN}"
+        if ok:
+            self.send_response(202)
+            payload = b'{"correlationid":"brave-otter-4718"}'
+        else:
+            self.send_response(401)
+            self.send_header("WWW-Authenticate", 'Bearer realm="eventbridge"')
+            payload = b'{"error":"authentication required"}'
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+
+    def do_GET(self):
+        evt = {"submitter": self.submitter, "submitteriss": self.submitteriss,
+               "phase": "prompt", "sequence": 0}
+        payload = (json.dumps(evt) + "\n").encode()
+        self.send_response(200)
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+
+    def log_message(self, *a):
+        pass
+
+
+def _run_gate(handler_cls, *, token=TOKEN, login=LOGIN) -> Checks:
+    """Drive the real `assert_identity_gate` against a fake bridge. Returns Checks."""
+    srv = HTTPServer(("127.0.0.1", 0), handler_cls)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    c = Checks(prefix="test")
+    f = flow.Flow.__new__(flow.Flow)
+    f.c = c
+    f.base = f"http://127.0.0.1:{srv.server_address[1]}"
+    f.args = types.SimpleNamespace(gh_login=login)
+    prior = os.environ.get("DEMO_GH_TOKEN")
+    try:
+        if token is None:
+            os.environ.pop("DEMO_GH_TOKEN", None)
+        else:
+            os.environ["DEMO_GH_TOKEN"] = token
+        f.assert_identity_gate()
+    finally:
+        srv.shutdown()
+        if prior is None:
+            os.environ.pop("DEMO_GH_TOKEN", None)
+        else:
+            os.environ["DEMO_GH_TOKEN"] = prior
+    return c
+
+
+def test_get_json_forwards_headers_and_is_unchanged_without_them():
+    """The prerequisite. `get_json` had no `headers` parameter, so no stage could send
+    an Authorization header at all."""
+    seen = {}
+
+    class H(BaseHTTPRequestHandler):
+        def do_GET(self):
+            seen.update(self.headers)
+            self.send_response(200)
+            self.send_header("Content-Length", "2")
+            self.end_headers()
+            self.wfile.write(b"{}")
+
+        def log_message(self, *a):
+            pass
+
+    srv = HTTPServer(("127.0.0.1", 0), H)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    url = f"http://127.0.0.1:{srv.server_address[1]}/x"
+    try:
+        status, _ = flow.get_json(url, headers={"Authorization": "Bearer abc"})
+        assert status == 200
+        assert seen.get("Authorization") == "Bearer abc"
+        seen.clear()
+        flow.get_json(url)
+        assert "Authorization" not in seen
+    finally:
+        srv.shutdown()
+
+
+def test_post_expecting_refusal_returns_the_refusal_instead_of_raising():
+    """`urlopen` raises HTTPError on 4xx, and the 401's WWW-Authenticate header — half
+    of what makes the refusal correct — is only reachable from the exception. A stage
+    built on `get_json` would surface a refusal as a crash."""
+    c = _run_gate(_Gate)
+    assert c.failed == 0, c.failures
+    code, headers, body = flow.post_expecting_refusal(
+        "http://127.0.0.1:1/unreachable", body=b"{}")
+    assert code is None, "no HTTP answer must be distinguishable from a refusal"
+    assert headers == {} and body is None
+
+
+def test_the_identity_gate_passes_against_a_correctly_configured_bridge():
+    c = _run_gate(_Gate)
+    assert c.failed == 0, c.failures
+    assert c.passed == 10, f"expected 10 assertions, got {c.passed}"
+
+
+def test_the_identity_gate_skips_without_a_token_rather_than_failing():
+    """Absent `DEMO_GH_TOKEN` the beat is not runnable. A red check there would mean
+    "you did not export a secret", which is not a finding about the system."""
+    c = _run_gate(_Gate, token=None)
+    assert (c.passed, c.failed) == (0, 0)
+
+
+def test_the_identity_gate_never_logs_the_token():
+    """The token is a live credential. It must not reach a terminal transcript that
+    gets pasted into an issue — the same rule `gen_signing_keys` follows for seeds."""
+    c = _run_gate(_Gate)
+    assert TOKEN not in " ".join(c.failures)
+    for key, val in (c.notes or {}).items():
+        assert TOKEN not in f"{key}{val}", f"token leaked into note {key!r}"
+
+
+def test_the_identity_gate_fails_when_authentication_is_off():
+    """The case that matters most: an open door must not read as a pass."""
+    class Open(_Gate):
+        open_door = True
+    c = _run_gate(Open)
+    assert c.failed >= 1, "an unauthenticated POST that succeeds must fail the beat"
+
+
+def test_the_identity_gate_fails_when_any_bearer_token_is_accepted():
+    """The subtle one. A gate that merely checks for a non-empty Authorization header
+    would refuse the no-credential request and accept a garbage token — passing a
+    naive beat. This is why the stage sends a deliberately invalid token."""
+    class AcceptAny(_Gate):
+        accept_any = True
+    c = _run_gate(AcceptAny)
+    assert c.failed >= 1, "accepting an unrecognised token must fail the beat"
+
+
+def test_the_identity_gate_fails_when_the_submitter_is_not_stamped():
+    """Authentication without attribution is half the beat: if the event does not
+    carry who asked, the downstream allowlist has nothing trustworthy to check."""
+    class NoSub(_Gate):
+        submitter = ""
+    c = _run_gate(NoSub)
+    assert c.failed >= 1
+
+
+def test_the_identity_gate_fails_when_the_issuer_is_not_github():
+    """`ce_submitteriss` is what lets a reader tell a GitHub-verified login from a name
+    an operator typed into an environment variable."""
+    class Static(_Gate):
+        submitteriss = "static"
+    c = _run_gate(Static)
+    assert c.failed >= 1
+
+
+def test_submitter_and_issuer_are_covered_by_the_signature():
+    """The premise the beat rests on, asserted against the real tuple rather than
+    quoted from a comment. If these left SIGNED_ATTRS, a forger could relabel who
+    asked without breaking the signature and the beat would be narrating a control
+    that no longer exists."""
+    assert "submitter" in S.SIGNED_ATTRS
+    assert "submitteriss" in S.SIGNED_ATTRS
+
+
+def test_the_signed_beats_default_on_for_the_auth_overlay_too():
+    """The bug this caught before it shipped. `signed_beats` read
+    `overlay == "kind-signed"`, so `kind-signed-auth` defaulted the beats OFF — every
+    signed assertion, including the identity gate that overlay exists for, would have
+    been skipped while the flow still reported success."""
+    assert _flow("kind-signed-auth").signed_beats is True
+    assert _flow("kind-signed").signed_beats is True
+    assert _flow("kind").signed_beats is False
+    assert _flow("kind-signed-auth", "--no-signed-beats").signed_beats is False
+
+
+def test_kind_signed_auth_is_an_accepted_overlay_everywhere_it_must_be():
+    """An overlay the deploy accepts but the flow rejects is the gap that left
+    `kind-signed` undriveable for a whole phase."""
+    assert flow.build_args(
+        ["--overlay", "kind-signed-auth"]).overlay == "kind-signed-auth"
+    for script in ("k8s_deploy.py", "k8s_preflight.py"):
+        src = (REPO / "scripts" / script).read_text()
+        assert "kind-signed-auth" in src, f"{script} does not accept the overlay"
+
+
+def test_the_identity_gate_is_called_from_main():
+    """The wiring guard. A stage nothing dispatches is the shape of the bugs the
+    cluster run found. Mutation-checked: removing the call from `main()` fails this."""
+    src = _flow_src()
+    assert _call_lines(src, "f.assert_identity_gate"), \
+        "assert_identity_gate is defined but never called from main()"
+    assert hasattr(flow.Flow, "assert_identity_gate")
+
+
+def test_the_token_is_read_from_the_environment_not_from_argv():
+    """A credential on the command line reaches `ps` and shell history. The flag
+    carries only the LOGIN, which is public."""
+    src = _flow_src()
+    assert 'os.environ.get("DEMO_GH_TOKEN"' in src
+    assert "--demo-gh-token" not in src and "--gh-token" not in src, \
+        "the token must not be an argparse flag"
