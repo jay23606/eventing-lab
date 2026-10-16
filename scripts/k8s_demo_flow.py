@@ -1411,7 +1411,8 @@ def build_args(argv=None):
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--namespace", "-n", default=os.environ.get("NS", "kev1"))
     ap.add_argument("--overlay", default="test",
-                    choices=("test", "kind", "kind-signed", "kind-signed-auth", "demo"))
+                    choices=("test", "kind", "kind-signed", "kind-signed-auth",
+                             "kind-signed-device", "demo"))
     ap.add_argument("--kubeconfig", default=None,
                     help="kubeconfig file (e.g. .kube/config-kind for a Kind cluster)")
     ap.add_argument("--context", default=None)

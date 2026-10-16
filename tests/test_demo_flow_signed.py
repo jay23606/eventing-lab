@@ -583,3 +583,16 @@ def test_the_token_is_read_from_the_environment_not_from_argv():
     assert 'os.environ.get("DEMO_GH_TOKEN"' in src
     assert "--demo-gh-token" not in src and "--gh-token" not in src, \
         "the token must not be an argparse flag"
+
+
+def test_the_device_overlay_is_accepted_and_runs_the_signed_beats():
+    """`kind-signed-device` is the device-flow sibling of `kind-signed-auth`. It must
+    be a valid `--overlay` in all three scripts AND default the signed beats on — the
+    `startswith("kind-signed")` rule covers it with no change, which is the point of
+    having fixed that rather than adding a second literal."""
+    assert flow.build_args(
+        ["--overlay", "kind-signed-device"]).overlay == "kind-signed-device"
+    assert _flow("kind-signed-device").signed_beats is True
+    for script in ("k8s_deploy.py", "k8s_preflight.py"):
+        src = (REPO / "scripts" / script).read_text()
+        assert "kind-signed-device" in src, f"{script} does not accept the overlay"

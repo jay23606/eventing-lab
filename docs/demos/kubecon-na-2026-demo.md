@@ -415,7 +415,28 @@ against a deliberately-broken bridge and require it to fail. **It has not run ag
 cluster**, so do not mark it 🟢 or narrate it as verified until it has —
 [eventing-lab#14](https://github.com/rossoctl/eventing-lab/issues/14).
 
-Needs its own overlay and a credential:
+Needs its own overlay and a credential. **Two ways to get the credential, and the
+difference is worth one sentence on the slide.**
+
+**The real one — GitHub sign-in in a browser** (`kind-signed-device`). Use this for the
+recording: it is what a user would actually do, and it shows a human signing in rather
+than pasting a token from a settings page.
+
+```sh
+# Prints a short code, opens github.com/login/device, polls until you authorise.
+eval "$(python3 scripts/login.py --client-id Ov23liA2Z4jfbFRoJKZn --open --export)"
+python3 scripts/k8s_deploy.py --yes --overlay kind-signed-device \
+  --signing-keys ~/.eventing-keys
+python3 scripts/k8s_demo_flow.py --overlay kind-signed-device \
+  --gh-login "$DEMO_GH_LOGIN" --public-url http://127.0.0.1:18080 --tag local1
+```
+
+`--open` is opt-in: the default prints the URL instead, because auto-opening fails
+silently over SSH and inside a container, which is where this is most often run (§2.2).
+The code appears **before** any browser launch, so a failed launch is not a dead end.
+
+**The deterministic one — a Personal Access Token** (`kind-signed-auth`). Use this in CI
+or when you do not want a browser in the loop:
 
 ```sh
 export DEMO_GH_TOKEN=ghp_...        # env only — a flag would reach `ps`
@@ -425,8 +446,18 @@ python3 scripts/k8s_demo_flow.py --overlay kind-signed-auth \
   --gh-login <your-login> --public-url http://127.0.0.1:18080 --tag local1
 ```
 
-Edit `EB_ALLOWED_USERS` and `ER_ALLOWED_SUBMITTERS` in
-`k8s/overlays/kind-signed-auth/` first — both ship as `CHANGEME` placeholders on purpose.
+Edit `EB_ALLOWED_USERS` and `ER_ALLOWED_SUBMITTERS` in whichever overlay you use first —
+both ship as `CHANGEME` placeholders on purpose, so a committed overlay never approves a
+specific person on every cluster it reaches.
+
+**Two things about the device flow that are worth saying out loud:**
+
+- **It needs no client secret**, which is why the client id is committed in the overlay
+  rather than mounted as a Secret. A redirect-based flow would need EventBridge to host
+  a callback at a URL GitHub can reach — and the demo runs behind a VPN, so that is
+  exactly what it cannot do. The device flow inverts it: nothing has to reach us.
+- **It requests no scopes.** `GET /user` returns the login for an unscoped token, so the
+  credential cannot read a repository even if it leaks.
 
 **On screen:** three `POST /v0/agents` calls in a row. No credential → **401** with
 `WWW-Authenticate: Bearer realm="eventbridge"`. A junk token → **401 again**. The approved

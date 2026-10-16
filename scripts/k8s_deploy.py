@@ -609,7 +609,8 @@ def build_args(argv=None):
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--namespace", "-n", default=os.environ.get("NS", "kev1"))
     ap.add_argument("--overlay", default="test",
-                    choices=("test", "kind", "demo", "kind-signed", "kind-signed-auth"))
+                    choices=("test", "kind", "demo", "kind-signed", "kind-signed-auth",
+                             "kind-signed-device"))
     ap.add_argument("--signing-keys", default=None, metavar="DIR",
                     help="key directory from scripts/gen_signing_keys.py. Applies one "
                          "seed Secret per service plus the approved-key ConfigMap. "
