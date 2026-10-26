@@ -176,6 +176,8 @@ class NtfyPublisher(threading.Thread):
             return self._store
         corr = event.get("correlationid")
         if self._owners is not None and corr:
+            # `_known` is intentionally ignored: unknown correlations use `shared/`, where group_of(corr)
+            # returns None, so the event is not suppressed.
             userkey, _known = self._owners.owner_of(corr)
             return self._stores.for_userkey(userkey)
         return self._stores.for_event(event)
