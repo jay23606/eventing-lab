@@ -104,11 +104,12 @@ class Kind:
         if self.exists():
             if not self.args.recreate:
                 self.c.log(f"cluster {self.name!r} already exists")
-                if not pathlib.Path(self.kubeconfig).is_file():
-                    res = run(["kind", "export", "kubeconfig", "--name", self.name,
-                               "--kubeconfig", self.kubeconfig], timeout=60)
-                    return self.c.expect_run(res, f"exported the kubeconfig for {self.name!r}")
-                return True
+                # Always re-export: a kubeconfig that exists but is stale (cluster since
+                # deleted, or exported under another --name) passes an is_file() check.
+                # `kind export kubeconfig` is idempotent, so this is safe to run every time.
+                res = run(["kind", "export", "kubeconfig", "--name", self.name,
+                           "--kubeconfig", self.kubeconfig], timeout=60)
+                return self.c.expect_run(res, f"exported the kubeconfig for {self.name!r}")
             self.c.log(f"--recreate: deleting cluster {self.name!r}")
             self.c.expect_run(run(["kind", "delete", "cluster", "--name", self.name],
                                   timeout=300),

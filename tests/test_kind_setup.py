@@ -3,7 +3,7 @@
 Regression tests for #25: `--check` on a cluster that exists but whose kubeconfig was
 never exported used to pass its first check and then die inside `check_resources()`
 with `RuntimeError: kubectl get nodes failed`. `--check` must report it and touch
-nothing; the install path must leave an existing kubeconfig alone.
+nothing; the install path must re-export the kubeconfig, whether it is absent or stale.
 """
 from pathlib import Path
 from types import SimpleNamespace
@@ -33,15 +33,26 @@ def test_check_reports_missing_kubeconfig(tmp_path, capsys):
     assert not kubeconfig.exists()
 
 
-def test_install_path_leaves_an_existing_kubeconfig_alone(tmp_path, monkeypatch):
+def test_install_path_re_exports_a_stale_kubeconfig(tmp_path, monkeypatch):
+    """The narrow form of #25: a kubeconfig that exists but is stale is as broken as an
+    absent one, so the install path must re-export it rather than trust is_file()."""
     kind, kubeconfig = _kind(tmp_path)
     kind.clusters = lambda: ["kev1"]
-    kubeconfig.write_text("apiVersion: v1\n")
-    monkeypatch.setattr(kind_setup, "run",
-                        mock.Mock(side_effect=AssertionError("run must not be called")))
+    kubeconfig.write_text("apiVersion: v1\nclusters: []\n")  # stale, not absent
+    calls = []
+
+    def fake_run(argv, **kwargs):
+        calls.append(list(argv))
+        if list(argv[:3]) == ["kind", "export", "kubeconfig"]:
+            Path(argv[argv.index("--kubeconfig") + 1]).write_text("refreshed\n")
+        return Result(argv=tuple(argv), rc=0, out="", err="", duration_s=0.0)
+
+    monkeypatch.setattr(kind_setup, "run", fake_run)
 
     assert kind.create() is True
-    assert kubeconfig.read_text() == "apiVersion: v1\n"
+    assert ["kind", "export", "kubeconfig", "--name", "kev1",
+            "--kubeconfig", str(kubeconfig)] in calls
+    assert kubeconfig.read_text() == "refreshed\n"
 
 
 def test_install_path_exports_kubeconfig_for_existing_cluster(tmp_path, monkeypatch):
